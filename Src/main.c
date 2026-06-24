@@ -21,6 +21,18 @@
 #define USART2_BRR     (*(volatile uint32_t*)(USART2_BASE + 0x08))
 #define USART2_CR1     (*(volatile uint32_t*)(USART2_BASE + 0x0C))
 
+#define SYSCFG_BASE     0x40013800
+#define SYSCFG_EXTICR2  (*(volatile uint32_t*)(SYSCFG_BASE + 0x0C))
+
+#define EXTI_BASE       0x40013C00
+#define EXTI_IMR        (*(volatile uint32_t*)(EXTI_BASE + 0x00))
+#define EXTI_RTSR       (*(volatile uint32_t*)(EXTI_BASE + 0x08))
+#define EXTI_PR         (*(volatile uint32_t*)(EXTI_BASE + 0x14))
+
+#define RCC_APB2ENR     (*(volatile uint32_t*)0x40023844)
+
+#define NVIC_ISER0 (*(volatile uint32_t*)0xE000E100)
+
 typedef enum {
     STATE_OFF = 0,
     STATE_PRECHARGE,
@@ -66,6 +78,26 @@ static void uart2_init(void)
     USART2_CR1 |= (1 << 13);             // UE
 }
 
+static void exti_init(void)
+{
+    // 1. Enable SYSCFG clock
+    RCC_APB2ENR |= (1 << 14);
+
+    // 2. Route PA5, PA6, PA7 to EXTI5/6/7
+    SYSCFG_EXTICR2 &= ~(0xFFF);   // PA = 0000
+
+    // 3. Enable EXTI lines 5, 6, 7
+    EXTI_IMR |= (1 << 5) | (1 << 6) | (1 << 7);
+
+    // 4. Rising edge trigger
+    EXTI_RTSR |= (1 << 5) | (1 << 6) | (1 << 7);
+
+    // 5. Enable NVIC interrupt for EXTI5–9
+    NVIC_ISER0 |= (1 << 23);
+}
+
+
+
 static void leds_off() {
     GPIOA_ODR &= ~(1 << 9);  // RED
     GPIOC_ODR &= ~(1 << 7);  // YELLOW
@@ -93,6 +125,29 @@ static void update_leds() {
             break;
     }
 }
+
+
+volatile int flag_ignition = 0;
+volatile int flag_brake    = 0;
+volatile int flag_ready    = 0;
+
+
+void EXTI9_5_IRQHandler(void)
+{
+    if (EXTI_PR & (1 << 5)) {
+        flag_ignition = 1;
+        EXTI_PR |= (1 << 5); // clear
+    }
+    if (EXTI_PR & (1 << 6)) {
+        flag_brake = 1;
+        EXTI_PR |= (1 << 6); // clear
+    }
+    if (EXTI_PR & (1 << 7)) {
+        flag_ready = 1;
+        EXTI_PR |= (1 << 7); // clear
+    }
+}
+
 
 int main(void) {
 
@@ -138,50 +193,49 @@ int main(void) {
     GPIOA_PUPDR |=  (2 << (6*2));  // pull-down
     GPIOA_PUPDR |=  (2 << (7*2));  // pull-down
 
-    while(1) {
+    exti_init();
 
-        int ignition = read_button_PA5();
-        int brake    = read_button_PA6();
-        int ready    = read_button_PA7();
+    while (1)
+    {
+        int ignition = flag_ignition;
+        int brake    = flag_brake;
+        int ready    = flag_ready;
 
-        switch(state) {
+        flag_ignition = 0;
+        flag_brake    = 0;
+        flag_ready    = 0;
 
+        switch(state)
+        {
             case STATE_OFF:
                 if (ignition) {
-                    uart2_print("[OFF] Ignition pressed -> PRECHARGE\r\n");
+                    uart2_print("[INT] Ignition -> PRECHARGE\r\n");
                     state = STATE_PRECHARGE;
-                    delay(200000);
                 }
                 break;
 
             case STATE_PRECHARGE:
                 if (ready && brake) {
-                    uart2_print("[PRECHARGE] Brake+Ready detected -> READY\r\n");
+                    uart2_print("[INT] Brake+Ready -> READY\r\n");
                     state = STATE_READY;
-                    delay(200000);
                 }
                 if (ready && !brake) {
-                    uart2_print("[PRECHARGE] FAULT: Ready pressed without brake\r\n");
+                    uart2_print("[INT] FAULT: Ready without brake\r\n");
                     state = STATE_FAULT;
                 }
                 break;
 
             case STATE_READY:
-                // Brake no longer required to stay in READY
                 if (ignition) {
-                    uart2_print("[READY] Ignition pressed -> OFF\r\n");
+                    uart2_print("[INT] Ignition -> OFF\r\n");
                     state = STATE_OFF;
-                    delay(200000);
                 }
                 break;
 
             case STATE_FAULT:
-                uart2_print("[FAULT] System locked. Press Ignition to reset.\r\n");
-
                 if (ignition) {
-                    uart2_print("[FAULT] Resetting -> OFF\r\n");
+                    uart2_print("[INT] Reset -> OFF\r\n");
                     state = STATE_OFF;
-                    delay(200000);
                 }
                 break;
         }
