@@ -27,11 +27,16 @@
 #define EXTI_BASE       0x40013C00
 #define EXTI_IMR        (*(volatile uint32_t*)(EXTI_BASE + 0x00))
 #define EXTI_RTSR       (*(volatile uint32_t*)(EXTI_BASE + 0x08))
+#define EXTI_FTSR       (*(volatile uint32_t*)(EXTI_BASE + 0x0C))
 #define EXTI_PR         (*(volatile uint32_t*)(EXTI_BASE + 0x14))
 
 #define RCC_APB2ENR     (*(volatile uint32_t*)0x40023844)
 
 #define NVIC_ISER0 (*(volatile uint32_t*)0xE000E100)
+
+#define SYST_CSR (*(volatile uint32_t*)0xE000E010)
+#define SYST_RVR (*(volatile uint32_t*)0xE000E014)
+#define SYST_CVR (*(volatile uint32_t*)0xE000E018)
 
 typedef enum {
     STATE_OFF = 0,
@@ -42,13 +47,15 @@ typedef enum {
 
 vehicle_state_t state = STATE_OFF;
 
-static void delay(volatile uint32_t t) {
-    while(t--);
-}
+volatile uint32_t system_time_ms = 0;  // incremented every 1 ms by SysTick
 
-static int read_button_PA5() { return (GPIOA_IDR & (1 << 5)) != 0; } // ignition
-static int read_button_PA6() { return (GPIOA_IDR & (1 << 6)) != 0; } // brake
-static int read_button_PA7() { return (GPIOA_IDR & (1 << 7)) != 0; } // ready
+volatile int flag_ignition = 0;
+volatile int flag_brake    = 0;
+volatile int flag_ready    = 0;
+
+volatile uint32_t last_ignition_time = 0;  // for 50 ms debounce
+volatile uint32_t last_brake_time    = 0;
+volatile uint32_t last_ready_time    = 0;
 
 void uart2_write(char c)
 {
@@ -56,7 +63,7 @@ void uart2_write(char c)
     USART2_DR = c;
 }
 
-void uart2_print(char *s)
+void uart2_print(const char *s)
 {
     while (*s)
         uart2_write(*s++);
@@ -78,6 +85,18 @@ static void uart2_init(void)
     USART2_CR1 |= (1 << 13);             // UE
 }
 
+static void systick_init(void)
+{
+    SYST_RVR = 16000 - 1;   // 16 MHz / 1000 Hz = 16000 ticks per ms
+    SYST_CVR = 0;           // clear current value
+    SYST_CSR = (1 << 2) | (1 << 1) | (1 << 0);  // CLKSOURCE, TICKINT, ENABLE
+}
+
+void SysTick_Handler(void)
+{
+    system_time_ms++;
+}
+
 static void exti_init(void)
 {
     // 1. Enable SYSCFG clock
@@ -89,14 +108,15 @@ static void exti_init(void)
     // 3. Enable EXTI lines 5, 6, 7
     EXTI_IMR |= (1 << 5) | (1 << 6) | (1 << 7);
 
-    // 4. Rising edge trigger
+    // 4. Rising edge trigger (button press)
     EXTI_RTSR |= (1 << 5) | (1 << 6) | (1 << 7);
 
-    // 5. Enable NVIC interrupt for EXTI5–9
+    // 5. Falling edge trigger (button release)
+    EXTI_FTSR |= (1 << 5) | (1 << 6) | (1 << 7);
+
+    // 6. Enable NVIC interrupt for EXTI5–9
     NVIC_ISER0 |= (1 << 23);
 }
-
-
 
 static void leds_off() {
     GPIOA_ODR &= ~(1 << 9);  // RED
@@ -121,33 +141,47 @@ static void update_leds() {
 
         case STATE_FAULT:
             GPIOA_ODR ^= (1 << 9);  // RED blink
-            delay(300000);
             break;
     }
 }
 
-
-volatile int flag_ignition = 0;
-volatile int flag_brake    = 0;
-volatile int flag_ready    = 0;
-
-
 void EXTI9_5_IRQHandler(void)
 {
+    uint32_t now = system_time_ms;
+
     if (EXTI_PR & (1 << 5)) {
-        flag_ignition = 1;
-        EXTI_PR |= (1 << 5); // clear
+        EXTI_PR |= (1 << 5); // clear pending
+
+        if (GPIOA_IDR & (1 << 5)) {  // rising edge = press
+            if ((now - last_ignition_time) >= 50) {  // 50 ms debounce
+                flag_ignition = 1;
+                last_ignition_time = now;
+            }
+        }
     }
+
     if (EXTI_PR & (1 << 6)) {
-        flag_brake = 1;
-        EXTI_PR |= (1 << 6); // clear
+        EXTI_PR |= (1 << 6); // clear pending
+
+        if (GPIOA_IDR & (1 << 6)) {  // rising edge = press
+            if ((now - last_brake_time) >= 50) {  // 50 ms debounce
+                flag_brake = 1;
+                last_brake_time = now;
+            }
+        }
     }
+
     if (EXTI_PR & (1 << 7)) {
-        flag_ready = 1;
-        EXTI_PR |= (1 << 7); // clear
+        EXTI_PR |= (1 << 7); // clear pending
+
+        if (GPIOA_IDR & (1 << 7)) {  // rising edge = press
+            if ((now - last_ready_time) >= 50) {  // 50 ms debounce
+                flag_ready = 1;
+                last_ready_time = now;
+            }
+        }
     }
 }
-
 
 int main(void) {
 
@@ -157,6 +191,8 @@ int main(void) {
     RCC_AHB1ENR |= (1 << 2); // GPIOC
 
     uart2_init();
+    systick_init();
+
     uart2_print("\r\n=== VEHICLE STARTUP CONTROLLER ===\r\n");
     uart2_print("Buttons:\r\n");
     uart2_print("  PA5 = Ignition\r\n");
@@ -169,6 +205,9 @@ int main(void) {
     uart2_print("  3. Press PA7 (Ready) to enter READY\r\n");
     uart2_print("  4. Green LED stays ON even after releasing brake\r\n");
     uart2_print("  5. If FAULT occurs, press PA5 to reset\r\n\r\n");
+
+    uart2_print("50 ms debounce ENABLED\r\n");
+    uart2_print("Rising + falling EXTI ENABLED\r\n\r\n");
 
     /* LED OUTPUTS */
     GPIOA_MODER &= ~(3 << (9*2));
@@ -194,6 +233,7 @@ int main(void) {
     GPIOA_PUPDR |=  (2 << (7*2));  // pull-down
 
     exti_init();
+    update_leds();  // initial LED state
 
     while (1)
     {
@@ -215,13 +255,20 @@ int main(void) {
                 break;
 
             case STATE_PRECHARGE:
-                if (ready && brake) {
-                    uart2_print("[INT] Brake+Ready -> READY\r\n");
-                    state = STATE_READY;
+                // Ready pressed: check if brake is CURRENTLY held
+                if (ready) {
+                    if (GPIOA_IDR & (1 << 6)) {
+                        uart2_print("[INT] Brake + Ready -> READY\r\n");
+                        state = STATE_READY;
+                    } else {
+                        uart2_print("[FAULT] Ready pressed without brake\r\n");
+                        state = STATE_FAULT;
+                    }
                 }
-                if (ready && !brake) {
-                    uart2_print("[INT] FAULT: Ready without brake\r\n");
-                    state = STATE_FAULT;
+
+                // Brake event alone doesn't transition state
+                if (brake) {
+                    uart2_print("[INT] Brake pressed\r\n");
                 }
                 break;
 
@@ -234,7 +281,7 @@ int main(void) {
 
             case STATE_FAULT:
                 if (ignition) {
-                    uart2_print("[INT] Reset -> OFF\r\n");
+                    uart2_print("[INT] Fault reset -> OFF\r\n");
                     state = STATE_OFF;
                 }
                 break;
